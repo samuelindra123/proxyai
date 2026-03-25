@@ -62,6 +62,93 @@ function buildUpstreamHeaders(extraHeaders = {}) {
   };
 }
 
+function createGatewayError(status, message, details) {
+  const error = new Error(message);
+  error.status = status;
+  error.payload = {
+    error: {
+      type: status >= 500 ? "api_error" : "invalid_request_error",
+      message,
+      ...(details ? { details } : {}),
+    },
+  };
+  return error;
+}
+
+function cleanText(value) {
+  if (typeof value !== "string") return "";
+  return value.replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
+}
+
+function normalizeContentValue(value) {
+  if (typeof value === "string") {
+    return cleanText(value);
+  }
+
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((item) => normalizeContentValue(item))
+      .filter(Boolean);
+    return cleanText(parts.join("\n"));
+  }
+
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+
+  if (typeof value.text === "string") {
+    return cleanText(value.text);
+  }
+
+  if (typeof value.content === "string") {
+    return cleanText(value.content);
+  }
+
+  if (Array.isArray(value.content)) {
+    return normalizeContentValue(value.content);
+  }
+
+  if (typeof value.value === "string") {
+    return cleanText(value.value);
+  }
+
+  return "";
+}
+
+function normalizeAssistantText(value) {
+  if (typeof value === "string") {
+    return cleanText(value);
+  }
+
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((block) => {
+        if (!block) return "";
+        if (typeof block === "string") return block;
+        if (block.type === "text" && typeof block.text === "string") return block.text;
+        if (typeof block.text === "string") return block.text;
+        if (typeof block.content === "string") return block.content;
+        if (Array.isArray(block.content)) return normalizeAssistantText(block.content);
+        return "";
+      })
+      .filter(Boolean);
+
+    return cleanText(parts.join("\n"));
+  }
+
+  if (value && typeof value === "object") {
+    if (typeof value.text === "string") return cleanText(value.text);
+    if (typeof value.content === "string") return cleanText(value.content);
+    if (Array.isArray(value.content)) return normalizeAssistantText(value.content);
+  }
+
+  return "";
+}
+
+function mapClientModelToUpstream() {
+  return DEFAULT_MODEL;
+}
+
 async function requestDigitalOceanChatCompletions(payload) {
   const response = await fetch(`${DO_BASE_URL}${DO_CHAT_COMPLETIONS_PATH}`, {
     method: "POST",
@@ -89,72 +176,93 @@ async function requestDigitalOceanChatCompletions(payload) {
 }
 
 function extractAssistantContent(openAIResponse) {
-  return openAIResponse?.choices?.[0]?.message?.content;
+  const choice = openAIResponse?.choices?.[0];
+  if (!choice || typeof choice !== "object") return "";
+
+  const messageContent = normalizeAssistantText(choice?.message?.content);
+  if (messageContent) return messageContent;
+
+  const textContent = normalizeAssistantText(choice?.text);
+  if (textContent) return textContent;
+
+  return "";
 }
 
 async function requestWithContentRecovery(payload) {
-  const first = await requestDigitalOceanChatCompletions(payload);
+  const firstResponse = await requestDigitalOceanChatCompletions(payload);
+  const firstText = extractAssistantContent(firstResponse);
 
-  if (typeof extractAssistantContent(first) === "string" && extractAssistantContent(first).trim() !== "") {
-    return first;
+  if (firstText) {
+    return { upstreamResponse: firstResponse, assistantText: firstText, retried: false };
   }
-
-  const retryMessages = [
-    {
-      role: "system",
-      content:
-        "Provide a direct final answer in message.content. Keep it concise and do not output internal reasoning.",
-    },
-    ...(Array.isArray(payload.messages) ? payload.messages : []),
-  ];
 
   const retryPayload = {
     ...payload,
-    messages: retryMessages,
-    max_tokens: Math.max(Number(payload.max_tokens || 0), 512),
-    reasoning_effort: payload.reasoning_effort || "low",
+    messages: [
+      {
+        role: "system",
+        content: "Provide a direct final answer in message.content. Do not output reasoning.",
+      },
+      ...(Array.isArray(payload.messages) ? payload.messages : []),
+    ],
+    stream: false,
   };
 
-  return requestDigitalOceanChatCompletions(retryPayload);
+  const retryResponse = await requestDigitalOceanChatCompletions(retryPayload);
+  const retryText = extractAssistantContent(retryResponse);
+
+  if (retryText) {
+    return { upstreamResponse: retryResponse, assistantText: retryText, retried: true };
+  }
+
+  throw createGatewayError(
+    502,
+    "Upstream returned no valid assistant content in choices[0].message.content or choices[0].text after one retry."
+  );
 }
 
 function anthropicBlocksToText(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-
-  return content
-    .filter((block) => block && block.type === "text" && typeof block.text === "string")
-    .map((block) => block.text)
-    .join("\n");
+  return normalizeContentValue(content);
 }
 
 function anthropicToOpenAIMessages(body) {
   const output = [];
 
-  if (body.system) {
-    if (typeof body.system === "string") {
-      output.push({ role: "system", content: body.system });
-    } else if (Array.isArray(body.system)) {
-      const text = body.system
-        .filter((item) => item && item.type === "text" && typeof item.text === "string")
-        .map((item) => item.text)
-        .join("\n");
-      if (text) output.push({ role: "system", content: text });
-    }
+  if (typeof body.system === "string" && cleanText(body.system)) {
+    output.push({ role: "system", content: cleanText(body.system) });
+  } else if (Array.isArray(body.system)) {
+    const systemText = normalizeContentValue(body.system);
+    if (systemText) output.push({ role: "system", content: systemText });
+  } else if (body.system && typeof body.system === "object") {
+    const systemText = normalizeContentValue(body.system);
+    if (systemText) output.push({ role: "system", content: systemText });
   }
 
   const messages = Array.isArray(body.messages) ? body.messages : [];
 
   for (const message of messages) {
-    if (!message || !message.role) continue;
+    if (!message || typeof message !== "object" || !message.role) continue;
+
+    const content = anthropicBlocksToText(message.content);
 
     output.push({
       role: message.role,
-      content: anthropicBlocksToText(message.content),
+      content,
     });
   }
 
   return output;
+}
+
+function normalizeChatMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+
+  return messages
+    .filter((message) => message && typeof message === "object" && message.role)
+    .map((message) => ({
+      ...message,
+      content: normalizeContentValue(message.content),
+    }));
 }
 
 function mapFinishReasonToAnthropicStopReason(finishReason) {
@@ -163,9 +271,8 @@ function mapFinishReasonToAnthropicStopReason(finishReason) {
   return "end_turn";
 }
 
-function toAnthropicResponse(openAIResponse, modelName) {
+function buildAnthropicResponse(modelName, openAIResponse, assistantText) {
   const choice = openAIResponse?.choices?.[0] || {};
-  const text = choice?.message?.content || choice?.message?.reasoning_content || "";
   const usage = openAIResponse?.usage || {};
 
   return {
@@ -173,14 +280,40 @@ function toAnthropicResponse(openAIResponse, modelName) {
     type: "message",
     role: "assistant",
     model: modelName,
-    content: [{ type: "text", text }],
+    content: [{ type: "text", text: assistantText }],
     stop_reason: mapFinishReasonToAnthropicStopReason(choice?.finish_reason),
     stop_sequence: null,
     usage: {
-      input_tokens: usage.prompt_tokens || 0,
-      output_tokens: usage.completion_tokens || 0,
+      input_tokens: Number(usage.prompt_tokens || 0),
+      output_tokens: Number(usage.completion_tokens || 0),
     },
   };
+}
+
+function buildChatCompletionsResponse(openAIResponse, assistantText, requestedModel, upstreamModel) {
+  const cloned = openAIResponse && typeof openAIResponse === "object" ? JSON.parse(JSON.stringify(openAIResponse)) : {};
+  const choice = cloned?.choices?.[0];
+
+  if (choice && typeof choice === "object") {
+    if (!choice.message || typeof choice.message !== "object") {
+      choice.message = { role: "assistant", content: assistantText };
+    } else {
+      choice.message.role = choice.message.role || "assistant";
+      choice.message.content = assistantText;
+    }
+
+    if ("text" in choice) {
+      choice.text = assistantText;
+    }
+  }
+
+  if (requestedModel) {
+    cloned.model = requestedModel;
+  } else if (upstreamModel) {
+    cloned.model = upstreamModel;
+  }
+
+  return cloned;
 }
 
 function writeSSE(res, event, data) {
@@ -248,19 +381,24 @@ app.get("/v1/models", requireGatewayToken, (req, res) => {
 app.post("/v1/chat/completions", requireGatewayToken, async (req, res) => {
   try {
     const body = req.body || {};
+    const requestedModel = typeof body.model === "string" && body.model.trim() ? body.model.trim() : DEFAULT_MODEL;
+    const upstreamModel = mapClientModelToUpstream(requestedModel);
 
     const payload = {
       ...body,
-      model: body.model || DEFAULT_MODEL,
+      model: upstreamModel,
+      messages: normalizeChatMessages(body.messages),
       max_tokens: body.max_tokens || 512,
-      reasoning_effort: body.reasoning_effort || "low",
+      stream: false,
     };
 
-    const upstreamResponse = await requestWithContentRecovery(payload);
-    res.status(200).json(upstreamResponse);
+    const { upstreamResponse, assistantText } = await requestWithContentRecovery(payload);
+    const response = buildChatCompletionsResponse(upstreamResponse, assistantText, requestedModel, upstreamModel);
+
+    res.status(200).json(response);
   } catch (error) {
     const status = error.status || 500;
-    const message = error.payload || { error: error.message || "Unknown error" };
+    const message = error.payload || { error: { type: "api_error", message: error.message || "Unknown error" } };
     res.status(status).json(message);
   }
 });
@@ -268,21 +406,21 @@ app.post("/v1/chat/completions", requireGatewayToken, async (req, res) => {
 app.post("/v1/messages", requireGatewayToken, async (req, res) => {
   try {
     const body = req.body || {};
-    const modelName = body.model || DEFAULT_MODEL;
+    const requestedModel = typeof body.model === "string" && body.model.trim() ? body.model.trim() : DEFAULT_MODEL;
+    const upstreamModel = mapClientModelToUpstream(requestedModel);
 
     const upstreamPayload = {
-      model: modelName,
+      model: upstreamModel,
       messages: anthropicToOpenAIMessages(body),
       max_tokens: body.max_tokens || 512,
       temperature: body.temperature,
       top_p: body.top_p,
       stop: body.stop_sequences,
-      reasoning_effort: body.reasoning_effort || "low",
       stream: false,
     };
 
-    const upstreamResponse = await requestWithContentRecovery(upstreamPayload);
-    const anthropicResponse = toAnthropicResponse(upstreamResponse, modelName);
+    const { upstreamResponse, assistantText } = await requestWithContentRecovery(upstreamPayload);
+    const anthropicResponse = buildAnthropicResponse(requestedModel, upstreamResponse, assistantText);
 
     if (body.stream === true) {
       res.setHeader("Content-Type", "text/event-stream");
