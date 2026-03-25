@@ -14,6 +14,8 @@ const DO_MODEL_ACCESS_KEY =
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "glm-5";
 const GATEWAY_API_TOKEN = process.env.GATEWAY_API_TOKEN || "";
 const DEBUG_LOGS = /^(1|true|yes|on)$/i.test(String(process.env.DEBUG_LOGS || ""));
+const RETRY_MIN_MAX_TOKENS = Number(process.env.RETRY_MIN_MAX_TOKENS || 256);
+const RETRY_TOKEN_BUFFER = Number(process.env.RETRY_TOKEN_BUFFER || 256);
 
 if (!DO_MODEL_ACCESS_KEY) {
   console.warn(
@@ -155,6 +157,12 @@ function normalizeAssistantText(content) {
   return "";
 }
 
+function toSafePositiveInteger(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
 function mapClientModelToUpstreamModel(clientModel) {
   const normalized = String(clientModel || "").trim().toLowerCase();
 
@@ -280,6 +288,10 @@ async function requestWithContentRecovery(payload, context = {}) {
       },
       ...(Array.isArray(payload.messages) ? payload.messages : []),
     ],
+    max_tokens: Math.max(
+      toSafePositiveInteger(payload?.max_tokens, RETRY_MIN_MAX_TOKENS) + RETRY_TOKEN_BUFFER,
+      RETRY_MIN_MAX_TOKENS
+    ),
     stream: false,
   };
 
@@ -474,7 +486,7 @@ app.post("/v1/chat/completions", requireGatewayToken, async (req, res) => {
       ...body,
       model: upstreamModel,
       messages: normalizeChatMessages(body.messages),
-      max_tokens: body.max_tokens || 512,
+      max_tokens: toSafePositiveInteger(body.max_tokens, 512),
       stream: false,
     };
 
@@ -506,7 +518,7 @@ app.post("/v1/messages", requireGatewayToken, async (req, res) => {
     const upstreamPayload = {
       model: upstreamModel,
       messages: anthropicToOpenAIMessages(body),
-      max_tokens: body.max_tokens || 512,
+      max_tokens: toSafePositiveInteger(body.max_tokens, 512),
       temperature: body.temperature,
       top_p: body.top_p,
       stop: body.stop_sequences,
