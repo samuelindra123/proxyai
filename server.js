@@ -16,6 +16,8 @@ const GATEWAY_API_TOKEN = process.env.GATEWAY_API_TOKEN || "";
 const DEBUG_LOGS = /^(1|true|yes|on)$/i.test(String(process.env.DEBUG_LOGS || ""));
 const RETRY_MIN_MAX_TOKENS = Number(process.env.RETRY_MIN_MAX_TOKENS || 256);
 const RETRY_TOKEN_BUFFER = Number(process.env.RETRY_TOKEN_BUFFER || 256);
+const UPSTREAM_MIN_COMPLETION_TOKENS = Number(process.env.UPSTREAM_MIN_COMPLETION_TOKENS || 256);
+const RETRY_MIN_COMPLETION_TOKENS = Number(process.env.RETRY_MIN_COMPLETION_TOKENS || 512);
 
 if (!DO_MODEL_ACCESS_KEY) {
   console.warn(
@@ -163,6 +165,21 @@ function toSafePositiveInteger(value, fallback) {
   return Math.floor(parsed);
 }
 
+function buildUpstreamTokenConfig(requestedMaxTokens, isRetry = false) {
+  const requested = toSafePositiveInteger(requestedMaxTokens, UPSTREAM_MIN_COMPLETION_TOKENS);
+  const base = Math.max(requested, UPSTREAM_MIN_COMPLETION_TOKENS);
+
+  if (isRetry) {
+    return {
+      max_completion_tokens: Math.max(base + RETRY_TOKEN_BUFFER, RETRY_MIN_COMPLETION_TOKENS),
+    };
+  }
+
+  return {
+    max_completion_tokens: base,
+  };
+}
+
 function mapClientModelToUpstreamModel(clientModel) {
   const normalized = String(clientModel || "").trim().toLowerCase();
 
@@ -288,12 +305,17 @@ async function requestWithContentRecovery(payload, context = {}) {
       },
       ...(Array.isArray(payload.messages) ? payload.messages : []),
     ],
-    max_tokens: Math.max(
-      toSafePositiveInteger(payload?.max_tokens, RETRY_MIN_MAX_TOKENS) + RETRY_TOKEN_BUFFER,
-      RETRY_MIN_MAX_TOKENS
-    ),
+    ...buildUpstreamTokenConfig(payload?.max_completion_tokens || payload?.max_tokens, true),
+    temperature: payload?.temperature ?? 0,
+    top_p: payload?.top_p ?? 1,
+    reasoning_effort: "none",
+    reasoning: {
+      effort: "none",
+      max_tokens: 0,
+    },
     stream: false,
   };
+  delete retryPayload.max_tokens;
 
   const retryResult = await requestDigitalOceanChatCompletions(retryPayload, {
     ...context,
@@ -486,9 +508,17 @@ app.post("/v1/chat/completions", requireGatewayToken, async (req, res) => {
       ...body,
       model: upstreamModel,
       messages: normalizeChatMessages(body.messages),
-      max_tokens: toSafePositiveInteger(body.max_tokens, 512),
+      ...buildUpstreamTokenConfig(body.max_completion_tokens || body.max_tokens, false),
+      temperature: body.temperature ?? 0,
+      top_p: body.top_p ?? 1,
+      reasoning_effort: "none",
+      reasoning: {
+        effort: "none",
+        max_tokens: 0,
+      },
       stream: false,
     };
+    delete upstreamPayload.max_tokens;
 
     const { upstreamResponse, assistantText } = await requestWithContentRecovery(upstreamPayload, {
       clientModel,
@@ -518,10 +548,15 @@ app.post("/v1/messages", requireGatewayToken, async (req, res) => {
     const upstreamPayload = {
       model: upstreamModel,
       messages: anthropicToOpenAIMessages(body),
-      max_tokens: toSafePositiveInteger(body.max_tokens, 512),
-      temperature: body.temperature,
-      top_p: body.top_p,
+      ...buildUpstreamTokenConfig(body.max_completion_tokens || body.max_tokens, false),
+      temperature: body.temperature ?? 0,
+      top_p: body.top_p ?? 1,
       stop: body.stop_sequences,
+      reasoning_effort: "none",
+      reasoning: {
+        effort: "none",
+        max_tokens: 0,
+      },
       stream: false,
     };
 
