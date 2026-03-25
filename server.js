@@ -18,6 +18,7 @@ const RETRY_MIN_MAX_TOKENS = Number(process.env.RETRY_MIN_MAX_TOKENS || 256);
 const RETRY_TOKEN_BUFFER = Number(process.env.RETRY_TOKEN_BUFFER || 256);
 const UPSTREAM_MIN_COMPLETION_TOKENS = Number(process.env.UPSTREAM_MIN_COMPLETION_TOKENS || 256);
 const RETRY_MIN_COMPLETION_TOKENS = Number(process.env.RETRY_MIN_COMPLETION_TOKENS || 512);
+const UPSTREAM_MAX_COMPLETION_TOKENS = Number(process.env.UPSTREAM_MAX_COMPLETION_TOKENS || 4096);
 
 if (!DO_MODEL_ACCESS_KEY) {
   console.warn(
@@ -167,11 +168,17 @@ function toSafePositiveInteger(value, fallback) {
 
 function buildUpstreamTokenConfig(requestedMaxTokens, isRetry = false) {
   const requested = toSafePositiveInteger(requestedMaxTokens, UPSTREAM_MIN_COMPLETION_TOKENS);
-  const base = Math.max(requested, UPSTREAM_MIN_COMPLETION_TOKENS);
+  const base = Math.min(
+    Math.max(requested, UPSTREAM_MIN_COMPLETION_TOKENS),
+    UPSTREAM_MAX_COMPLETION_TOKENS
+  );
 
   if (isRetry) {
     return {
-      max_completion_tokens: Math.max(base + RETRY_TOKEN_BUFFER, RETRY_MIN_COMPLETION_TOKENS),
+      max_completion_tokens: Math.min(
+        Math.max(base + RETRY_TOKEN_BUFFER, RETRY_MIN_COMPLETION_TOKENS),
+        UPSTREAM_MAX_COMPLETION_TOKENS
+      ),
     };
   }
 
