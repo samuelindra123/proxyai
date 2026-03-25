@@ -13,6 +13,7 @@ const DO_MODEL_ACCESS_KEY =
   process.env.DO_MODEL_ACCESS_KEY || process.env.DIGITALOCEAN_MODEL_ACCESS_KEY || "";
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "glm-5";
 const GATEWAY_API_TOKEN = process.env.GATEWAY_API_TOKEN || "";
+const DEBUG_LOGS = /^(1|true|yes|on)$/i.test(String(process.env.DEBUG_LOGS || ""));
 
 if (!DO_MODEL_ACCESS_KEY) {
   console.warn(
@@ -22,6 +23,17 @@ if (!DO_MODEL_ACCESS_KEY) {
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+
+function debugLog(message, meta) {
+  if (!DEBUG_LOGS) return;
+
+  if (meta === undefined) {
+    console.log(`[DEBUG] ${message}`);
+    return;
+  }
+
+  console.log(`[DEBUG] ${message}`, meta);
+}
 
 function getBearerToken(authorizationHeader) {
   if (typeof authorizationHeader !== "string") return "";
@@ -86,9 +98,7 @@ function normalizeContentValue(value) {
   }
 
   if (Array.isArray(value)) {
-    const parts = value
-      .map((item) => normalizeContentValue(item))
-      .filter(Boolean);
+    const parts = value.map((item) => normalizeContentValue(item)).filter(Boolean);
     return cleanText(parts.join("\n"));
   }
 
@@ -115,20 +125,20 @@ function normalizeContentValue(value) {
   return "";
 }
 
-function normalizeAssistantText(value) {
-  if (typeof value === "string") {
-    return cleanText(value);
+function normalizeAssistantText(content) {
+  if (typeof content === "string") {
+    return cleanText(content);
   }
 
-  if (Array.isArray(value)) {
-    const parts = value
-      .map((block) => {
-        if (!block) return "";
-        if (typeof block === "string") return block;
-        if (block.type === "text" && typeof block.text === "string") return block.text;
-        if (typeof block.text === "string") return block.text;
-        if (typeof block.content === "string") return block.content;
-        if (Array.isArray(block.content)) return normalizeAssistantText(block.content);
+  if (Array.isArray(content)) {
+    const parts = content
+      .map((item) => {
+        if (!item) return "";
+        if (typeof item === "string") return item;
+        if (item.type === "text" && typeof item.text === "string") return item.text;
+        if (typeof item.text === "string") return item.text;
+        if (typeof item.content === "string") return item.content;
+        if (Array.isArray(item.content)) return normalizeAssistantText(item.content);
         return "";
       })
       .filter(Boolean);
@@ -136,20 +146,59 @@ function normalizeAssistantText(value) {
     return cleanText(parts.join("\n"));
   }
 
-  if (value && typeof value === "object") {
-    if (typeof value.text === "string") return cleanText(value.text);
-    if (typeof value.content === "string") return cleanText(value.content);
-    if (Array.isArray(value.content)) return normalizeAssistantText(value.content);
+  if (content && typeof content === "object") {
+    if (typeof content.text === "string") return cleanText(content.text);
+    if (typeof content.content === "string") return cleanText(content.content);
+    if (Array.isArray(content.content)) return normalizeAssistantText(content.content);
   }
 
   return "";
 }
 
-function mapClientModelToUpstream() {
+function mapClientModelToUpstreamModel(clientModel) {
+  const normalized = String(clientModel || "").trim().toLowerCase();
+
+  if (!normalized) return DEFAULT_MODEL;
+
+  if (
+    normalized.startsWith("claude") ||
+    normalized.startsWith("sonnet") ||
+    normalized.startsWith("opus") ||
+    normalized.startsWith("haiku")
+  ) {
+    return DEFAULT_MODEL;
+  }
+
+  if (normalized === DEFAULT_MODEL.toLowerCase()) {
+    return DEFAULT_MODEL;
+  }
+
   return DEFAULT_MODEL;
 }
 
-async function requestDigitalOceanChatCompletions(payload) {
+function summarizeUpstreamResponseShape(upstreamResponse) {
+  const choice = upstreamResponse?.choices?.[0];
+  return {
+    has_choices: Array.isArray(upstreamResponse?.choices),
+    choices_count: Array.isArray(upstreamResponse?.choices) ? upstreamResponse.choices.length : 0,
+    has_message: Boolean(choice?.message),
+    message_content_type: Array.isArray(choice?.message?.content)
+      ? "array"
+      : typeof choice?.message?.content,
+    text_type: typeof choice?.text,
+    finish_reason: choice?.finish_reason || null,
+    usage_present: Boolean(upstreamResponse?.usage),
+  };
+}
+
+async function requestDigitalOceanChatCompletions(payload, context = {}) {
+  debugLog("Upstream request", {
+    endpoint: `${DO_BASE_URL}${DO_CHAT_COMPLETIONS_PATH}`,
+    clientModel: context.clientModel || null,
+    upstreamModel: payload?.model || null,
+    stream: Boolean(payload?.stream),
+  });
+
   const response = await fetch(`${DO_BASE_URL}${DO_CHAT_COMPLETIONS_PATH}`, {
     method: "POST",
     headers: buildUpstreamHeaders(),
@@ -165,6 +214,13 @@ async function requestDigitalOceanChatCompletions(payload) {
     parsed = { raw: text };
   }
 
+  debugLog("Upstream response", {
+    status: response.status,
+    clientModel: context.clientModel || null,
+    upstreamModel: payload?.model || null,
+    summary: summarizeUpstreamResponseShape(parsed),
+  });
+
   if (!response.ok) {
     const err = new Error("Upstream request failed");
     err.status = response.status;
@@ -172,29 +228,48 @@ async function requestDigitalOceanChatCompletions(payload) {
     throw err;
   }
 
-  return parsed;
+  return { status: response.status, data: parsed };
 }
 
-function extractAssistantContent(openAIResponse) {
-  const choice = openAIResponse?.choices?.[0];
+function extractFinalAssistantText(upstreamResponse) {
+  const choice = upstreamResponse?.choices?.[0];
   if (!choice || typeof choice !== "object") return "";
 
-  const messageContent = normalizeAssistantText(choice?.message?.content);
-  if (messageContent) return messageContent;
+  if (typeof choice?.message?.content === "string") {
+    const text = normalizeAssistantText(choice.message.content);
+    if (text) return text;
+  }
 
-  const textContent = normalizeAssistantText(choice?.text);
-  if (textContent) return textContent;
+  if (Array.isArray(choice?.message?.content) || (choice?.message?.content && typeof choice?.message?.content === "object")) {
+    const text = normalizeAssistantText(choice.message.content);
+    if (text) return text;
+  }
+
+  if (typeof choice?.text === "string" || Array.isArray(choice?.text) || (choice?.text && typeof choice?.text === "object")) {
+    const text = normalizeAssistantText(choice.text);
+    if (text) return text;
+  }
 
   return "";
 }
 
-async function requestWithContentRecovery(payload) {
-  const firstResponse = await requestDigitalOceanChatCompletions(payload);
-  const firstText = extractAssistantContent(firstResponse);
+async function requestWithContentRecovery(payload, context = {}) {
+  const firstResult = await requestDigitalOceanChatCompletions(payload, context);
+  const firstText = extractFinalAssistantText(firstResult.data);
 
   if (firstText) {
-    return { upstreamResponse: firstResponse, assistantText: firstText, retried: false };
+    return {
+      upstreamStatus: firstResult.status,
+      upstreamResponse: firstResult.data,
+      assistantText: firstText,
+      retried: false,
+    };
   }
+
+  debugLog("Retrying upstream request because assistant text was empty", {
+    clientModel: context.clientModel || null,
+    upstreamModel: payload?.model || null,
+  });
 
   const retryPayload = {
     ...payload,
@@ -208,11 +283,19 @@ async function requestWithContentRecovery(payload) {
     stream: false,
   };
 
-  const retryResponse = await requestDigitalOceanChatCompletions(retryPayload);
-  const retryText = extractAssistantContent(retryResponse);
+  const retryResult = await requestDigitalOceanChatCompletions(retryPayload, {
+    ...context,
+    retry: true,
+  });
+  const retryText = extractFinalAssistantText(retryResult.data);
 
   if (retryText) {
-    return { upstreamResponse: retryResponse, assistantText: retryText, retried: true };
+    return {
+      upstreamStatus: retryResult.status,
+      upstreamResponse: retryResult.data,
+      assistantText: retryText,
+      retried: true,
+    };
   }
 
   throw createGatewayError(
@@ -230,10 +313,7 @@ function anthropicToOpenAIMessages(body) {
 
   if (typeof body.system === "string" && cleanText(body.system)) {
     output.push({ role: "system", content: cleanText(body.system) });
-  } else if (Array.isArray(body.system)) {
-    const systemText = normalizeContentValue(body.system);
-    if (systemText) output.push({ role: "system", content: systemText });
-  } else if (body.system && typeof body.system === "object") {
+  } else if (Array.isArray(body.system) || (body.system && typeof body.system === "object")) {
     const systemText = normalizeContentValue(body.system);
     if (systemText) output.push({ role: "system", content: systemText });
   }
@@ -243,11 +323,9 @@ function anthropicToOpenAIMessages(body) {
   for (const message of messages) {
     if (!message || typeof message !== "object" || !message.role) continue;
 
-    const content = anthropicBlocksToText(message.content);
-
     output.push({
       role: message.role,
-      content,
+      content: anthropicBlocksToText(message.content),
     });
   }
 
@@ -271,15 +349,15 @@ function mapFinishReasonToAnthropicStopReason(finishReason) {
   return "end_turn";
 }
 
-function buildAnthropicResponse(modelName, openAIResponse, assistantText) {
-  const choice = openAIResponse?.choices?.[0] || {};
-  const usage = openAIResponse?.usage || {};
+function buildAnthropicResponse(clientModel, upstreamResponse, assistantText) {
+  const choice = upstreamResponse?.choices?.[0] || {};
+  const usage = upstreamResponse?.usage || {};
 
   return {
     id: `msg_${Date.now()}`,
     type: "message",
     role: "assistant",
-    model: modelName,
+    model: clientModel,
     content: [{ type: "text", text: assistantText }],
     stop_reason: mapFinishReasonToAnthropicStopReason(choice?.finish_reason),
     stop_sequence: null,
@@ -290,28 +368,28 @@ function buildAnthropicResponse(modelName, openAIResponse, assistantText) {
   };
 }
 
-function buildChatCompletionsResponse(openAIResponse, assistantText, requestedModel, upstreamModel) {
-  const cloned = openAIResponse && typeof openAIResponse === "object" ? JSON.parse(JSON.stringify(openAIResponse)) : {};
+function buildChatCompletionsResponse(upstreamResponse, assistantText, clientModel, upstreamModel) {
+  const cloned =
+    upstreamResponse && typeof upstreamResponse === "object" ? JSON.parse(JSON.stringify(upstreamResponse)) : {};
   const choice = cloned?.choices?.[0];
 
   if (choice && typeof choice === "object") {
-    if (!choice.message || typeof choice.message !== "object") {
-      choice.message = { role: "assistant", content: assistantText };
-    } else {
-      choice.message.role = choice.message.role || "assistant";
-      choice.message.content = assistantText;
-    }
+    choice.message = {
+      role: "assistant",
+      content: assistantText,
+    };
 
     if ("text" in choice) {
       choice.text = assistantText;
     }
+
+    if (choice.message && typeof choice.message === "object") {
+      delete choice.message.reasoning_content;
+      delete choice.message.reasoning;
+    }
   }
 
-  if (requestedModel) {
-    cloned.model = requestedModel;
-  } else if (upstreamModel) {
-    cloned.model = upstreamModel;
-  }
+  cloned.model = clientModel || upstreamModel || DEFAULT_MODEL;
 
   return cloned;
 }
@@ -332,7 +410,10 @@ function sendAnthropicStreamFromText(res, anthropicResponse) {
       role: "assistant",
       model: anthropicResponse.model,
       content: [],
-      usage: { input_tokens: anthropicResponse.usage.input_tokens, output_tokens: 0 },
+      usage: {
+        input_tokens: anthropicResponse.usage.input_tokens,
+        output_tokens: 0,
+      },
     },
   });
 
@@ -381,10 +462,15 @@ app.get("/v1/models", requireGatewayToken, (req, res) => {
 app.post("/v1/chat/completions", requireGatewayToken, async (req, res) => {
   try {
     const body = req.body || {};
-    const requestedModel = typeof body.model === "string" && body.model.trim() ? body.model.trim() : DEFAULT_MODEL;
-    const upstreamModel = mapClientModelToUpstream(requestedModel);
+    const clientModel = typeof body.model === "string" && body.model.trim() ? body.model.trim() : DEFAULT_MODEL;
+    const upstreamModel = mapClientModelToUpstreamModel(clientModel);
 
-    const payload = {
+    debugLog("Resolved model mapping for /v1/chat/completions", {
+      clientModel,
+      upstreamModel,
+    });
+
+    const upstreamPayload = {
       ...body,
       model: upstreamModel,
       messages: normalizeChatMessages(body.messages),
@@ -392,10 +478,13 @@ app.post("/v1/chat/completions", requireGatewayToken, async (req, res) => {
       stream: false,
     };
 
-    const { upstreamResponse, assistantText } = await requestWithContentRecovery(payload);
-    const response = buildChatCompletionsResponse(upstreamResponse, assistantText, requestedModel, upstreamModel);
+    const { upstreamResponse, assistantText } = await requestWithContentRecovery(upstreamPayload, {
+      clientModel,
+      upstreamModel,
+      endpoint: "/v1/chat/completions",
+    });
 
-    res.status(200).json(response);
+    res.status(200).json(buildChatCompletionsResponse(upstreamResponse, assistantText, clientModel, upstreamModel));
   } catch (error) {
     const status = error.status || 500;
     const message = error.payload || { error: { type: "api_error", message: error.message || "Unknown error" } };
@@ -406,8 +495,13 @@ app.post("/v1/chat/completions", requireGatewayToken, async (req, res) => {
 app.post("/v1/messages", requireGatewayToken, async (req, res) => {
   try {
     const body = req.body || {};
-    const requestedModel = typeof body.model === "string" && body.model.trim() ? body.model.trim() : DEFAULT_MODEL;
-    const upstreamModel = mapClientModelToUpstream(requestedModel);
+    const clientModel = typeof body.model === "string" && body.model.trim() ? body.model.trim() : DEFAULT_MODEL;
+    const upstreamModel = mapClientModelToUpstreamModel(clientModel);
+
+    debugLog("Resolved model mapping for /v1/messages", {
+      clientModel,
+      upstreamModel,
+    });
 
     const upstreamPayload = {
       model: upstreamModel,
@@ -419,8 +513,13 @@ app.post("/v1/messages", requireGatewayToken, async (req, res) => {
       stream: false,
     };
 
-    const { upstreamResponse, assistantText } = await requestWithContentRecovery(upstreamPayload);
-    const anthropicResponse = buildAnthropicResponse(requestedModel, upstreamResponse, assistantText);
+    const { upstreamResponse, assistantText } = await requestWithContentRecovery(upstreamPayload, {
+      clientModel,
+      upstreamModel,
+      endpoint: "/v1/messages",
+    });
+
+    const anthropicResponse = buildAnthropicResponse(clientModel, upstreamResponse, assistantText);
 
     if (body.stream === true) {
       res.setHeader("Content-Type", "text/event-stream");
